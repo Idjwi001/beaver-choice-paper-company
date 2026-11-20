@@ -639,7 +639,7 @@ import difflib
 from dataclasses import dataclass, field
 from typing import Optional
 
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -1147,9 +1147,24 @@ def compose_customer_response(order: OrderContext) -> str:
     return " ".join(parts)
 
 
+def _sellable_lines(order: OrderContext) -> List[LineItem]:
+    return [l for l in order.line_items if l.status in ("available", "restock")]
+
+
 def tool_compose_customer_response(ctx: RunContext[OrderContext]) -> str:
-    """Return a draft customer reply built from the order record (safe to send as-is)."""
-    return compose_customer_response(ctx.deps)
+    """Return the customer reply built from the order record (send it as-is).
+
+    Guard: refuses (asks the model to retry) if the workflow is incomplete, so
+    the orchestrator can never confirm an order that was not booked.
+    """
+    order = ctx.deps
+    if order.line_items and all(l.status == "pending" for l in order.line_items):
+        raise ModelRetry("Inventory has not been checked yet. Call delegate_to_inventory_agent first.")
+    if _sellable_lines(order) and order.quote_total <= 0:
+        raise ModelRetry("Some lines can be fulfilled but no quote exists. Call delegate_to_quoting_agent.")
+    if _sellable_lines(order) and not order.sale_completed and not order.sale_note:
+        raise ModelRetry("The quote has not been finalized. Call delegate_to_sales_agent before replying.")
+    return compose_customer_response(order)
 
 
 # ---------------------------------------------------------------------------
@@ -1348,6 +1363,10 @@ async def tool_delegate_to_inventory_agent(ctx: RunContext[OrderContext]) -> str
 async def tool_delegate_to_quoting_agent(ctx: RunContext[OrderContext]) -> str:
     """Ask the Quoting Agent to price the fulfillable lines (with bulk discounts)."""
     order = ctx.deps
+    if not order.line_items or all(l.status == "pending" for l in order.line_items):
+        raise ModelRetry("Call delegate_to_inventory_agent before asking for a quote.")
+    if not _sellable_lines(order):
+        return "Nothing to quote: no line can be fulfilled. Call compose_customer_response."
     sellable = [l.catalog_item for l in order.line_items if l.status in ("available", "restock")]
     event_match = re.search(r"\b(ceremony|parade|conference|reception|party|assembly|exhibition|"
                             r"show|gathering|performance|demonstration|concert|festival|meeting)\b",
@@ -1363,10 +1382,15 @@ async def tool_delegate_to_quoting_agent(ctx: RunContext[OrderContext]) -> str:
 async def tool_delegate_to_sales_agent(ctx: RunContext[OrderContext]) -> str:
     """Ask the Sales Agent to finalize the quoted sale in the database."""
     order = ctx.deps
+    if order.quote_total <= 0:
+        raise ModelRetry("There is no quote yet. Call delegate_to_quoting_agent first.")
+    if order.sale_completed:
+        return "The sale is already booked. Call compose_customer_response."
     is_large = order.quote_total >= LARGE_ORDER_THRESHOLD
     prompt = (f"LARGE_ORDER={'yes' if is_large else 'no'}\n"
               f"Quoted total: ${order.quote_total:,.2f}. Finalize the sale.")
     result = await sales_agent.run(prompt, deps=order, usage=ctx.usage)
+    order.sale_note = result.output
     order.log(f"sales agent: {result.output}")
     return result.output
 
@@ -1384,10 +1408,11 @@ orchestrator_agent = Agent(
         "3. If at least one line is AVAILABLE or RESTOCK_REQUIRED, call "
         "delegate_to_quoting_agent and then delegate_to_sales_agent (the customer has asked "
         "to place the order, so quotes are accepted automatically).\n"
-        "4. Call compose_customer_response and reply to the customer with that text. You may "
-        "polish the wording but keep every item, price, discount reason, delivery date and "
-        "reason for unavailable items. NEVER reveal cash balances, supplier costs, margins, "
-        "transaction ids or internal errors."
+        "4. Only after the sale is finalized (or when nothing can be fulfilled) call "
+        "compose_customer_response and reply with exactly that text.\n"
+        "Never skip steps 2-3 when something can be fulfilled: an order is NOT confirmed "
+        "until delegate_to_sales_agent has booked it. NEVER reveal cash balances, supplier "
+        "costs, margins, internal status codes, transaction ids or internal errors."
     ),
     tools=named_tools([tool_parse_request, tool_delegate_to_inventory_agent,
                        tool_delegate_to_quoting_agent, tool_delegate_to_sales_agent,
@@ -1402,6 +1427,13 @@ def handle_customer_request(request_with_date: str) -> str:
                          deadline=parsed["deadline"])
     try:
         result = orchestrator_agent.run_sync(request_with_date, deps=order)
+        order.log(f"orchestrator final message: {result.output.strip()}")
+        # The customer-facing reply is always the policy-checked text built from
+        # the order record. It holds every item, price, discount reason, delivery
+        # date and refusal reason, and never internal data. The LLM's free-form
+        # wording is only kept in the internal log.
+        if order.line_items:
+            return compose_customer_response(order)
         return result.output.strip()
     except Exception as error:  # never leak internal errors to the customer
         print(f"INTERNAL ERROR while handling request: {error!r}")
