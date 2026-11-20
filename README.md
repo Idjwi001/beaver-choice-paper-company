@@ -92,3 +92,17 @@ Make sure to submit the following files:
 4. Outputs from your test run (like `test_results.csv`)
 
 ---
+---
+
+## Solution (Beaver's Choice multi-agent system)
+
+* **Implementation:** `project_starter.py` (pydantic-ai, 4 agents: Orchestrator, Inventory, Quoting, Sales)
+* **Workflow diagram:** `workflow_diagram.png` (Mermaid source: `workflow_diagram.mmd`)
+* **Evaluation output:** `test_results.csv`
+* **Reflection report:** `REPORT.md`
+
+Run with an API key in `.env` (LLM mode) or without one in deterministic offline mode:
+
+```bash
+BEAVER_OFFLINE=1 python project_starter.py
+```

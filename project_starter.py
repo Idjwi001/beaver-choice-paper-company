@@ -168,7 +168,26 @@ def init_database(db_engine: Engine, seed: int = 137) -> Engine:
         # ----------------------------
         # 2. Load and initialize 'quote_requests' table
         # ----------------------------
-        quote_requests_df = pd.read_csv("quote_requests.csv")
+        # NOTE: 'quote_requests.csv' was not included in the repository. If it is
+        # missing, build a stand-in table (one row per historical quote) whose
+        # 'response' text is derived from the quote metadata, so that
+        # search_quote_history() can still join the two tables and match on
+        # job type / event type / quote explanation.
+        if os.path.exists("quote_requests.csv"):
+            quote_requests_df = pd.read_csv("quote_requests.csv")
+        else:
+            _quotes_meta = pd.read_csv("quotes.csv")["request_metadata"].apply(
+                lambda x: ast.literal_eval(x) if isinstance(x, str) else {}
+            )
+            quote_requests_df = pd.DataFrame({
+                "job": _quotes_meta.apply(lambda m: m.get("job_type", "")),
+                "need_size": _quotes_meta.apply(lambda m: m.get("order_size", "")),
+                "event": _quotes_meta.apply(lambda m: m.get("event_type", "")),
+                "response": _quotes_meta.apply(
+                    lambda m: f"{m.get('order_size', '')} order from a {m.get('job_type', '')} "
+                              f"for a {m.get('event_type', '')}"
+                ),
+            })
         quote_requests_df["id"] = range(1, len(quote_requests_df) + 1)
         quote_requests_df.to_sql("quote_requests", db_engine, if_exists="replace", index=False)
 
@@ -587,9 +606,293 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 ########################
 ########################
 ########################
+#
+# Architecture overview (see workflow_diagram.png and REPORT.md)
+# ---------------------------------------------------------------
+# Framework: pydantic-ai
+# Agents (4 in total, limit is 5):
+#   1. Orchestrator Agent  - reads the customer request, delegates to the
+#                            workers below and writes the customer reply.
+#   2. Inventory Agent     - matches requested items to the catalog, checks
+#                            stock, decides on supplier restocking.
+#   3. Quoting Agent       - prices the order, applies bulk discounts and
+#                            compares with historical quotes.
+#   4. Sales Agent         - runs a financial health check and books the
+#                            sale in the database.
+#
+# Data is passed between agents through a shared per-request "blackboard"
+# (the OrderContext dataclass, injected as pydantic-ai `deps`). Agents decide
+# WHICH tools to call and WHEN; the tools hold the business rules so numbers
+# written to the database are always deterministic and auditable.
+#
+# Run modes
+#   * LLM mode     (default when UDACITY_OPENAI_API_KEY is set): every agent is
+#                  backed by an OpenAI model through the Vocareum proxy.
+#   * Offline mode (no API key, or BEAVER_OFFLINE=1): every agent is backed by
+#                  a pydantic-ai FunctionModel running a scripted, rule-based
+#                  policy. The SAME agents, tools and database code are used,
+#                  so the system can be evaluated without network access.
 
+import re
+import json
+import difflib
+from dataclasses import dataclass, field
+from typing import Optional
+
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 # Set up and load your env parameters and instantiate your model.
+dotenv.load_dotenv()
+
+OPENAI_BASE_URL = "https://openai.vocareum.com/v1"
+OPENAI_MODEL_NAME = os.getenv("BEAVER_MODEL_NAME", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("UDACITY_OPENAI_API_KEY")
+OFFLINE_MODE = os.getenv("BEAVER_OFFLINE") == "1" or not OPENAI_API_KEY
+
+# ---------------------------------------------------------------------------
+# Business policy constants
+# ---------------------------------------------------------------------------
+SHEETS_PER_REAM = 500            # a ream of paper is 500 sheets
+MINIMUM_CASH_RESERVE = 2000.00   # never let a supplier purchase push cash below this
+LARGE_ORDER_THRESHOLD = 500.00   # orders above this trigger a full financial health check
+RESTOCK_TARGET_MULTIPLIER = 2    # after a sale, carried items are topped up to 2x min_stock_level
+SUPPLIER_COST_RATIO = 0.70       # we buy from the supplier at 70% of our list price (30% gross margin);
+                                 # the largest bulk discount (15%) therefore never sells below cost
+
+# Bulk discount tiers: (minimum total units in the order, discount rate, label)
+BULK_DISCOUNT_TIERS = [
+    (20000, 0.15, "15% volume discount for orders of 20,000+ units"),
+    (5000, 0.10, "10% bulk discount for orders of 5,000+ units"),
+    (1000, 0.05, "5% bulk discount for orders of 1,000+ units"),
+]
+
+# Catalog lookup: item_name -> catalog record (from the starter's paper_supplies)
+CATALOG = {item["item_name"]: item for item in paper_supplies}
+
+
+# ---------------------------------------------------------------------------
+# Shared blackboard passed to all agents as pydantic-ai `deps`
+# ---------------------------------------------------------------------------
+@dataclass
+class LineItem:
+    """One requested product line and everything the agents learn about it."""
+    description: str                     # customer wording, e.g. "A4 glossy paper"
+    quantity: int                        # quantity in catalog units (sheets/units)
+    catalog_item: Optional[str] = None   # matched catalog item name
+    status: str = "pending"              # pending | available | restock | unavailable
+    reason: str = ""                     # customer-safe explanation
+    stock_on_hand: int = 0
+    restock_quantity: int = 0
+    restock_eta: Optional[str] = None
+    restock_placed: bool = False
+    delivery_date: Optional[str] = None
+    unit_price: float = 0.0
+    line_total: float = 0.0
+    sold: bool = False
+
+
+@dataclass
+class OrderContext:
+    """Per-request state shared by the orchestrator and the worker agents."""
+    request_text: str
+    request_date: str
+    deadline: Optional[str] = None
+    line_items: List[LineItem] = field(default_factory=list)
+    quote_subtotal: float = 0.0
+    discount_rate: float = 0.0
+    discount_label: str = ""
+    quote_total: float = 0.0
+    history_note: str = ""
+    sale_completed: bool = False
+    sale_note: str = ""
+    agent_log: List[str] = field(default_factory=list)
+
+    def log(self, message: str) -> None:
+        """Keep an internal audit trail (never shown to the customer)."""
+        self.agent_log.append(message)
+
+
+# ---------------------------------------------------------------------------
+# Request parsing and catalog matching helpers (pure functions)
+# ---------------------------------------------------------------------------
+_NUMBER = r"(?<![\w.,])(\d{1,3}(?:,\d{3})+|\d+)"
+_UNIT = r"(sheets?|reams?|rolls?|packets?|packs?|boxes?|units?|pieces?|pads?)"
+_TERMINATOR = (
+    r"(?=,(?=\s*(?:and\s+)?\d)|,\s*and\b|;|\n|\.(?:\s|$)|\s+and\s+\d|"
+    r"\s+for\s+(?:our|the|an?|my|your)\b|\s+in\s+time\b|\s+along\s+with\b|$)"
+)
+LINE_ITEM_PATTERN = re.compile(
+    _NUMBER + r"\s+(?:" + _UNIT + r"\s+(?:of\s+)?)?(.+?)" + _TERMINATOR,
+    re.IGNORECASE,
+)
+DEADLINE_PATTERN = re.compile(r"\bby\s+([A-Z][a-z]+\s+\d{1,2},\s*\d{4})")
+REQUEST_DATE_PATTERN = re.compile(r"Date of request:\s*(\d{4}-\d{2}-\d{2})")
+
+# Ordered keyword rules: the first rule whose keywords all appear wins.
+# Product-specific words come first, generic paper words last.
+CATALOG_KEYWORD_RULES = [
+    (["washi"], "Decorative adhesive tape (washi tape)"),
+    (["tape"], "Decorative adhesive tape (washi tape)"),
+    (["streamer"], "Party streamers"),
+    (["napkin"], "Paper napkins"),
+    (["plate"], "Paper plates"),
+    (["disposable", "cup"], "Disposable cups"),
+    (["cup"], "Paper cups"),
+    (["envelope"], "Envelopes"),
+    (["sticky"], "Sticky notes"),
+    (["notepad"], "Notepads"),
+    (["invitation"], "Invitation cards"),
+    (["flyer"], "Flyers"),
+    (["table cover"], "Table covers"),
+    (["tablecloth"], "Table covers"),
+    (["folder"], "Presentation folders"),
+    (["name tag"], "Name tags with lanyards"),
+    (["party bag"], "Paper party bags"),
+    (["poster board"], "Large poster paper (24x36 inches)"),
+    (["24\" x 36"], "Large poster paper (24x36 inches)"),
+    (["24x36"], "Large poster paper (24x36 inches)"),
+    (["banner", "roll"], "Rolls of banner paper (36-inch width)"),
+    (["banner"], "Banner paper"),
+    (["100 lb"], "100 lb cover stock"),
+    (["cover stock"], "100 lb cover stock"),
+    (["80 lb"], "80 lb text paper"),
+    (["250 gsm"], "250 gsm cardstock"),
+    (["220 gsm"], "220 gsm poster paper"),
+    (["poster paper"], "Poster paper"),
+    (["cardstock"], "Cardstock"),
+    (["card stock"], "Cardstock"),
+    (["heavyweight"], "Heavyweight paper"),
+    (["glossy"], "Glossy paper"),
+    (["matte"], "Matte paper"),
+    (["photo"], "Photo paper"),
+    (["construction"], "Construction paper"),
+    (["kraft"], "Kraft paper"),
+    (["butcher"], "Butcher paper"),
+    (["crepe"], "Crepe paper"),
+    (["wrapping"], "Wrapping paper"),
+    (["glitter"], "Glitter paper"),
+    (["decorative paper"], "Decorative paper"),
+    (["letterhead"], "Letterhead paper"),
+    (["legal"], "Legal-size paper"),
+    (["patterned"], "Patterned paper"),
+    (["uncoated"], "Uncoated paper"),
+    (["bright"], "Bright-colored paper"),
+    (["colored"], "Colored paper"),
+    (["colorful"], "Colored paper"),
+    (["coloured"], "Colored paper"),
+    (["recycled"], "Recycled paper"),
+    (["eco"], "Eco-friendly paper"),
+    (["letter"], "Letter-sized paper"),
+    (["a4"], "A4 paper"),
+    (["printer"], "Standard copy paper"),
+    (["printing"], "Standard copy paper"),
+    (["copy"], "Standard copy paper"),
+    (["white paper"], "Standard copy paper"),
+]
+
+# Paper formats we do not sell at all (checked before keyword rules).
+UNSUPPORTED_FORMATS = ["a3", "a5"]
+
+
+def parse_customer_request(request_text: str) -> Dict:
+    """Extract line items, deadline and request date from free-text request.
+
+    Quantities given in reams are converted to sheets. Returns a dict with keys
+    'items' (list of {description, quantity}), 'deadline' and 'request_date'.
+    """
+    items = []
+    for match in LINE_ITEM_PATTERN.finditer(request_text):
+        number, unit, description = match.groups()
+        description = description.strip(" .-:\"'")
+        if not re.search(r"[A-Za-z]{3,}", description):
+            continue  # e.g. stray numbers from dates
+        quantity = int(number.replace(",", ""))
+        if unit and unit.lower().startswith("ream"):
+            quantity *= SHEETS_PER_REAM
+            description = f"{description} ({number} reams)"
+        items.append({"description": description, "quantity": quantity})
+
+    deadline = None
+    deadline_match = DEADLINE_PATTERN.search(request_text)
+    if deadline_match:
+        try:
+            deadline = datetime.strptime(
+                deadline_match.group(1).replace(",", ", ").replace("  ", " "), "%B %d, %Y"
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            deadline = None
+
+    date_match = REQUEST_DATE_PATTERN.search(request_text)
+    request_date = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
+    return {"items": items, "deadline": deadline, "request_date": request_date}
+
+
+def match_catalog_item(description: str) -> Optional[str]:
+    """Map a customer description (e.g. 'A4 glossy paper') to a catalog item name.
+
+    Returns None when the item is not something Beaver's Choice sells.
+    """
+    text_lower = description.lower()
+    if any(re.search(rf"\b{fmt}\b", text_lower) for fmt in UNSUPPORTED_FORMATS):
+        return None
+    for keywords, item_name in CATALOG_KEYWORD_RULES:
+        if all(keyword in text_lower for keyword in keywords):
+            return item_name
+    # Fuzzy fallback for close spellings ("Kraft papers", "Cardstocks" ...)
+    close = difflib.get_close_matches(description.title(), list(CATALOG), n=1, cutoff=0.8)
+    return close[0] if close else None
+
+
+def get_min_stock_level(item_name: str) -> int:
+    """Return the configured minimum stock level (0 for items we do not normally carry)."""
+    result = pd.read_sql(
+        "SELECT min_stock_level FROM inventory WHERE item_name = :item_name",
+        db_engine,
+        params={"item_name": item_name},
+    )
+    return int(result.iloc[0]["min_stock_level"]) if not result.empty else 0
+
+
+def get_unit_price(item_name: str) -> float:
+    """List price per unit, taken from the inventory table or the full catalog."""
+    result = pd.read_sql(
+        "SELECT unit_price FROM inventory WHERE item_name = :item_name",
+        db_engine,
+        params={"item_name": item_name},
+    )
+    if not result.empty:
+        return float(result.iloc[0]["unit_price"])
+    return float(CATALOG[item_name]["unit_price"])
+
+
+def get_supplier_unit_cost(item_name: str) -> float:
+    """Wholesale cost per unit when restocking from the supplier (internal only)."""
+    return round(get_unit_price(item_name) * SUPPLIER_COST_RATIO, 4)
+
+
+def select_bulk_discount(total_units: int) -> tuple:
+    """Return (rate, label) of the best bulk discount tier for this many units."""
+    for minimum_units, rate, label in BULK_DISCOUNT_TIERS:
+        if total_units >= minimum_units:
+            return rate, label
+    return 0.0, ""
+
+
+def format_date(iso_date: Optional[str]) -> str:
+    """Render an ISO date as e.g. 'April 15, 2025' for customer messages."""
+    if not iso_date:
+        return "as soon as possible"
+    return datetime.strptime(iso_date[:10], "%Y-%m-%d").strftime("%B %d, %Y").replace(" 0", " ")
 
 
 """Set up tools for your agents to use, these should be methods that combine the database functions above
@@ -597,15 +900,515 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 
 
 # Tools for inventory agent
+def tool_get_inventory_snapshot(ctx: RunContext[OrderContext]) -> str:
+    """Return every item currently in stock with its quantity (uses get_all_inventory)."""
+    snapshot = get_all_inventory(ctx.deps.request_date)
+    ctx.deps.log(f"inventory snapshot: {len(snapshot)} items in stock")
+    return json.dumps({name: int(qty) for name, qty in snapshot.items()})
+
+
+def tool_check_stock_level(ctx: RunContext[OrderContext], item_name: str) -> str:
+    """Return the current stock of one catalog item as of the request date (uses get_stock_level)."""
+    stock_df = get_stock_level(item_name, ctx.deps.request_date)
+    return f"{item_name}: {int(stock_df['current_stock'].iloc[0])} units in stock"
+
+
+def tool_check_supplier_delivery(ctx: RunContext[OrderContext], quantity: int) -> str:
+    """Return when the supplier could deliver `quantity` units if ordered today (uses get_supplier_delivery_date)."""
+    return get_supplier_delivery_date(ctx.deps.request_date, quantity)
+
+
+def tool_assess_line_item(ctx: RunContext[OrderContext], line_index: int) -> str:
+    """Assess one requested line: match it to the catalog, check stock, and if
+    stock is short decide whether a supplier restock can arrive before the
+    customer's deadline and can be paid for. Records the decision on the order.
+
+    Returns a status string starting with AVAILABLE, RESTOCK_REQUIRED or UNAVAILABLE.
+    """
+    order = ctx.deps
+    line = order.line_items[line_index]
+    line.catalog_item = match_catalog_item(line.description)
+    if line.catalog_item is None:
+        line.status = "unavailable"
+        line.reason = f"'{line.description}' is not part of our product catalog"
+        return f"UNAVAILABLE: {line.reason}"
+
+    stock = int(get_stock_level(line.catalog_item, order.request_date)["current_stock"].iloc[0])
+    line.stock_on_hand = stock
+    min_level = get_min_stock_level(line.catalog_item)
+    stock_after_sale = stock - line.quantity
+
+    # Reorder policy: cover any shortfall and, for carried items, top the shelf
+    # back up to RESTOCK_TARGET_MULTIPLIER x min_stock_level after the sale.
+    target_level = RESTOCK_TARGET_MULTIPLIER * min_level
+    reorder_quantity = max(0, target_level - stock_after_sale) if stock_after_sale < min_level else 0
+    reorder_quantity = max(reorder_quantity, -stock_after_sale)
+
+    if stock_after_sale >= 0:
+        line.status = "available"
+        line.delivery_date = order.request_date
+        line.restock_quantity = reorder_quantity
+        if reorder_quantity:
+            line.restock_eta = get_supplier_delivery_date(order.request_date, reorder_quantity)
+            return (f"AVAILABLE: {stock} in stock for {line.quantity} requested "
+                    f"({line.catalog_item}). Stock will fall below minimum level {min_level}; "
+                    f"RESTOCK_RECOMMENDED {reorder_quantity} units (ETA {line.restock_eta}).")
+        return f"AVAILABLE: {stock} in stock for {line.quantity} requested ({line.catalog_item})."
+
+    # Not enough stock: can the supplier deliver in time?
+    eta = get_supplier_delivery_date(order.request_date, reorder_quantity)
+    line.restock_quantity = reorder_quantity
+    line.restock_eta = eta
+    if order.deadline and eta > order.deadline:
+        line.status = "unavailable"
+        on_hand = (f"we only have {stock:,} units of {line.catalog_item} on hand" if stock > 0
+                   else f"{line.catalog_item} is currently out of stock")
+        line.reason = (f"{on_hand} and a supplier "
+                       f"delivery would not arrive until {format_date(eta)}, after your requested "
+                       f"date of {format_date(order.deadline)}")
+        return f"UNAVAILABLE: {line.reason}"
+
+    restock_cost = reorder_quantity * get_supplier_unit_cost(line.catalog_item)
+    cash = get_cash_balance(order.request_date)
+    if cash - restock_cost < MINIMUM_CASH_RESERVE:
+        line.status = "unavailable"
+        line.reason = (f"we cannot source the additional {line.catalog_item} needed for this "
+                       f"quantity at the moment")
+        order.log(f"restock of {line.catalog_item} blocked by cash reserve (cash {cash:.2f})")
+        return f"UNAVAILABLE: insufficient funds to restock ({line.reason})"
+
+    line.status = "restock"
+    line.delivery_date = eta
+    return (f"RESTOCK_REQUIRED: only {stock} in stock for {line.quantity} requested "
+            f"({line.catalog_item}); order {reorder_quantity} units from supplier, ETA {eta} "
+            f"(deadline {order.deadline or 'none'}).")
+
+
+def tool_place_supplier_restock(ctx: RunContext[OrderContext], line_index: int) -> str:
+    """Place the supplier purchase order decided by assess_line_item for this line
+    (records a 'stock_orders' transaction with create_transaction)."""
+    order = ctx.deps
+    line = order.line_items[line_index]
+    if line.restock_placed or line.restock_quantity <= 0 or line.status == "unavailable":
+        return "No restock needed for this line."
+    cost = round(line.restock_quantity * get_supplier_unit_cost(line.catalog_item), 2)
+    if get_cash_balance(order.request_date) - cost < MINIMUM_CASH_RESERVE:
+        return "Restock skipped: it would breach the minimum cash reserve."
+    transaction_id = create_transaction(
+        line.catalog_item, "stock_orders", line.restock_quantity, cost, order.request_date
+    )
+    line.restock_placed = True
+    order.log(f"restock #{transaction_id}: {line.restock_quantity} x {line.catalog_item} for ${cost:.2f}")
+    return f"Supplier order #{transaction_id} placed: {line.restock_quantity} x {line.catalog_item}, ETA {line.restock_eta}."
 
 
 # Tools for quoting agent
+def tool_search_quote_history(ctx: RunContext[OrderContext], search_terms: List[str]) -> str:
+    """Search historical quotes for similar requests (uses search_quote_history)."""
+    matches = search_quote_history(search_terms, limit=5)
+    summary = [
+        {"total_amount": m["total_amount"], "order_size": m["order_size"],
+         "event_type": m["event_type"], "explanation": str(m["quote_explanation"])[:160]}
+        for m in matches
+    ]
+    if matches:
+        amounts = [float(m["total_amount"]) for m in matches]
+        ctx.deps.history_note = (
+            f"{len(matches)} comparable past quotes ranged from ${min(amounts):,.2f} to "
+            f"${max(amounts):,.2f}"
+        )
+    return json.dumps(summary)
+
+
+def tool_calculate_quote(ctx: RunContext[OrderContext]) -> str:
+    """Price every fulfillable line at list price and apply the bulk discount tier
+    that matches the total number of units. Records the quote on the order."""
+    order = ctx.deps
+    sellable = [line for line in order.line_items if line.status in ("available", "restock")]
+    if not sellable:
+        return "Nothing to quote: no line can be fulfilled."
+    subtotal = 0.0
+    for line in sellable:
+        line.unit_price = get_unit_price(line.catalog_item)
+        line.line_total = round(line.unit_price * line.quantity, 2)
+        subtotal += line.line_total
+    total_units = sum(line.quantity for line in sellable)
+    rate, label = select_bulk_discount(total_units)
+    order.quote_subtotal = round(subtotal, 2)
+    order.discount_rate = rate
+    order.discount_label = label
+    order.quote_total = round(subtotal * (1 - rate), 2)
+    lines = [f"{l.quantity} x {l.catalog_item} @ ${l.unit_price:.2f} = ${l.line_total:,.2f}" for l in sellable]
+    return (f"QUOTE: {'; '.join(lines)}. Subtotal ${order.quote_subtotal:,.2f}, "
+            f"discount {rate:.0%} ({label or 'none'}), total ${order.quote_total:,.2f}.")
 
 
 # Tools for ordering agent
+def tool_check_cash_balance(ctx: RunContext[OrderContext]) -> str:
+    """Return the company's cash balance as of the request date (uses get_cash_balance)."""
+    return f"${get_cash_balance(ctx.deps.request_date):,.2f}"
+
+
+def tool_financial_health_check(ctx: RunContext[OrderContext]) -> str:
+    """Generate the company financial report (uses generate_financial_report) and
+    summarise it; used as a health check before booking large orders."""
+    report = generate_financial_report(ctx.deps.request_date)
+    low_stock = [i["item_name"] for i in report["inventory_summary"] if i["stock"] < 100]
+    summary = (f"cash ${report['cash_balance']:,.2f}, inventory value "
+               f"${report['inventory_value']:,.2f}, total assets ${report['total_assets']:,.2f}, "
+               f"low-stock items: {low_stock or 'none'}")
+    ctx.deps.log(f"health check: {summary}")
+    return summary
+
+
+def tool_finalize_sale(ctx: RunContext[OrderContext]) -> str:
+    """Book the quoted sale: one 'sales' transaction per fulfillable line at the
+    discounted price (uses create_transaction). Re-checks stock first."""
+    order = ctx.deps
+    sellable = [l for l in order.line_items if l.status in ("available", "restock") and not l.sold]
+    if not sellable or order.quote_total <= 0:
+        return "No sale to finalize."
+    booked = []
+    for line in sellable:
+        stock = int(get_stock_level(line.catalog_item, order.request_date)["current_stock"].iloc[0])
+        if stock < line.quantity:
+            line.status = "unavailable"
+            line.reason = f"stock of {line.catalog_item} changed before we could confirm your order"
+            continue
+        discounted_price = round(line.line_total * (1 - order.discount_rate), 2)
+        transaction_id = create_transaction(
+            line.catalog_item, "sales", line.quantity, discounted_price, order.request_date
+        )
+        line.sold = True
+        booked.append(f"#{transaction_id} {line.quantity} x {line.catalog_item} ${discounted_price:,.2f}")
+    order.sale_completed = bool(booked)
+    order.quote_total = round(sum(l.line_total for l in order.line_items if l.sold) * (1 - order.discount_rate), 2)
+    order.log("sale booked: " + "; ".join(booked))
+    return "SALE BOOKED: " + ("; ".join(booked) if booked else "nothing booked")
+
+
+# Tools for orchestrator agent (delegation + customer response)
+def tool_get_order_status(ctx: RunContext[OrderContext]) -> str:
+    """Return the shared order record (customer-safe fields only) as JSON."""
+    order = ctx.deps
+    return json.dumps({
+        "request_date": order.request_date,
+        "deadline": order.deadline,
+        "lines": [
+            {"index": i, "description": l.description, "quantity": l.quantity,
+             "catalog_item": l.catalog_item, "status": l.status, "reason": l.reason,
+             "delivery_date": l.delivery_date, "unit_price": l.unit_price, "sold": l.sold}
+            for i, l in enumerate(order.line_items)
+        ],
+        "subtotal": order.quote_subtotal, "discount_rate": order.discount_rate,
+        "discount_reason": order.discount_label, "total": order.quote_total,
+        "sale_completed": order.sale_completed,
+    })
+
+
+def compose_customer_response(order: OrderContext) -> str:
+    """Build the customer-facing reply from the shared order record.
+
+    Contains the items, prices, discount rationale, delivery dates and reasons
+    for anything we cannot supply - but no internal data (cash, margins, ids).
+    """
+    sold = [l for l in order.line_items if l.sold]
+    unavailable = [l for l in order.line_items if l.status == "unavailable"]
+    parts = []
+    if sold:
+        lines = "; ".join(f"{l.quantity:,} x {l.catalog_item} at ${l.unit_price:.2f} each "
+                          f"(${l.line_total:,.2f})" for l in sold)
+        latest_delivery = max(l.delivery_date or order.request_date for l in sold)
+        parts.append(f"Thank you for your order! We have confirmed: {lines}.")
+        if order.discount_rate:
+            parts.append(f"Subtotal ${sum(l.line_total for l in sold):,.2f}; we applied a "
+                         f"{order.discount_label} to reward your order size, bringing your "
+                         f"total to ${order.quote_total:,.2f}.")
+        else:
+            parts.append(f"Your total is ${order.quote_total:,.2f} at our standard list prices "
+                         f"(bulk discounts start at 1,000 units).")
+        if order.history_note:
+            parts.append("Prices follow our published list prices and the same bulk-discount "
+                         "approach we have used when quoting similar orders in the past.")
+        deadline_note = f", ahead of your requested date of {format_date(order.deadline)}" if order.deadline else ""
+        parts.append(f"Expected delivery: {format_date(latest_delivery)}{deadline_note}.")
+    if unavailable:
+        reasons = "; ".join(f"{l.quantity:,} x {l.description}: {l.reason}" for l in unavailable)
+        prefix = "Unfortunately we could not include" if sold else "Unfortunately we are unable to fulfill your request. We could not supply"
+        parts.append(f"{prefix} the following: {reasons}.")
+        partial = [l for l in unavailable if l.catalog_item and l.stock_on_hand > 0]
+        if partial:
+            offers = ", ".join(f"{l.stock_on_hand:,} x {l.catalog_item}" for l in partial)
+            parts.append(f"If helpful, we can supply {offers} right away or deliver the full "
+                         f"quantity on a later date - just let us know.")
+    if not order.line_items:
+        parts.append("We could not identify any products and quantities in your message. "
+                     "Please list the items and quantities you need and we will send a quote.")
+    return " ".join(parts)
+
+
+def tool_compose_customer_response(ctx: RunContext[OrderContext]) -> str:
+    """Return a draft customer reply built from the order record (safe to send as-is)."""
+    return compose_customer_response(ctx.deps)
+
+
+# ---------------------------------------------------------------------------
+# Offline (scripted) policies used when no LLM is available.
+# Each policy receives the conversation so far and returns the next tool call,
+# exactly as an LLM would. This keeps the agent/tool flow identical.
+# ---------------------------------------------------------------------------
+def _tool_history(messages: List[ModelMessage]) -> List[tuple]:
+    """Return [(tool_name, content)] for every tool result seen so far."""
+    history = []
+    for message in messages:
+        if isinstance(message, ModelRequest):
+            for part in message.parts:
+                if isinstance(part, ToolReturnPart):
+                    history.append((part.tool_name, str(part.content)))
+    return history
+
+
+def _user_prompt(messages: List[ModelMessage]) -> str:
+    for message in messages:
+        if isinstance(message, ModelRequest):
+            for part in message.parts:
+                if isinstance(part, UserPromptPart):
+                    return str(part.content)
+    return ""
+
+
+def _call(tool_name: str, **args) -> ModelResponse:
+    return ModelResponse(parts=[ToolCallPart(tool_name=tool_name, args=args)])
+
+
+def _reply(text_content: str) -> ModelResponse:
+    return ModelResponse(parts=[TextPart(content=text_content)])
+
+
+def inventory_policy(messages: List[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Snapshot inventory, then assess every line and place any needed restock."""
+    history = _tool_history(messages)
+    line_count = int(re.search(r"LINE_COUNT=(\d+)", _user_prompt(messages)).group(1))
+    if not history:
+        return _call("get_inventory_snapshot")
+    assessed = [content for name, content in history if name == "assess_line_item"]
+    last_name, last_content = history[-1]
+    if last_name == "assess_line_item" and "RESTOCK" in last_content:
+        return _call("place_supplier_restock", line_index=len(assessed) - 1)
+    if len(assessed) < line_count:
+        return _call("assess_line_item", line_index=len(assessed))
+    return _reply("Inventory assessment complete: " + " | ".join(assessed))
+
+
+def quoting_policy(messages: List[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Look up comparable historical quotes, then calculate the quote."""
+    history = _tool_history(messages)
+    if not history:
+        terms = re.search(r"SEARCH_TERMS=(.*)", _user_prompt(messages)).group(1).split("|")
+        return _call("search_quote_history", search_terms=[t for t in terms if t][:1])
+    if history[-1][0] == "search_quote_history":
+        return _call("calculate_quote")
+    return _reply(history[-1][1])
+
+
+def sales_policy(messages: List[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Check cash, run a health check for large orders, then book the sale."""
+    history = _tool_history(messages)
+    called = [name for name, _ in history]
+    is_large = "LARGE_ORDER=yes" in _user_prompt(messages)
+    if "check_cash_balance" not in called:
+        return _call("check_cash_balance")
+    if is_large and "financial_health_check" not in called:
+        return _call("financial_health_check")
+    if "finalize_sale" not in called:
+        return _call("finalize_sale")
+    return _reply(history[-1][1])
+
+
+def orchestrator_policy(messages: List[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Parse -> inventory -> (quote -> sale if anything is sellable) -> reply."""
+    history = _tool_history(messages)
+    called = [name for name, _ in history]
+    if "parse_request" not in called:
+        return _call("parse_request")
+    if "delegate_to_inventory_agent" not in called:
+        if '"items": []' in dict(history)["parse_request"]:
+            return _call("compose_customer_response")
+        return _call("delegate_to_inventory_agent")
+    sellable = "AVAILABLE" in dict(history)["delegate_to_inventory_agent"] or \
+        "RESTOCK_REQUIRED" in dict(history)["delegate_to_inventory_agent"]
+    if sellable and "delegate_to_quoting_agent" not in called:
+        return _call("delegate_to_quoting_agent")
+    if sellable and "delegate_to_sales_agent" not in called:
+        return _call("delegate_to_sales_agent")
+    if "compose_customer_response" not in called:
+        return _call("compose_customer_response")
+    return _reply(history[-1][1])
+
+
+# ---------------------------------------------------------------------------
+# Model factory
+# ---------------------------------------------------------------------------
+def build_model(offline_policy):
+    """Return an OpenAI-backed model, or a FunctionModel running `offline_policy`."""
+    if OFFLINE_MODE:
+        return FunctionModel(offline_policy)
+    try:  # pydantic-ai >= 1.0
+        from pydantic_ai.models.openai import OpenAIChatModel as OpenAIModelClass
+    except ImportError:  # older pydantic-ai releases
+        from pydantic_ai.models.openai import OpenAIModel as OpenAIModelClass
+    from pydantic_ai.providers.openai import OpenAIProvider
+    provider = OpenAIProvider(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
+    return OpenAIModelClass(OPENAI_MODEL_NAME, provider=provider)
 
 
 # Set up your agents and create an orchestration agent that will manage them.
+from pydantic_ai import Tool  # noqa: E402  (kept next to the agent definitions for readability)
+
+
+def named_tools(functions) -> List[Tool]:
+    """Wrap tool functions so the LLM sees clean names (without the 'tool_' prefix)."""
+    return [Tool(function, name=function.__name__.replace("tool_", "", 1)) for function in functions]
+
+
+inventory_agent = Agent(
+    build_model(inventory_policy),
+    deps_type=OrderContext,
+    output_type=str,
+    name="inventory_agent",
+    system_prompt=(
+        "You are the Inventory Agent for Beaver's Choice Paper Company. "
+        "First call get_inventory_snapshot. Then call assess_line_item once for EVERY line "
+        "index from 0 to LINE_COUNT-1. Whenever an assessment mentions RESTOCK_REQUIRED or "
+        "RESTOCK_RECOMMENDED, immediately call place_supplier_restock for that line index. "
+        "Use check_stock_level / check_supplier_delivery for stock questions. "
+        "Finish with a one-line internal status per line, keeping the words AVAILABLE, "
+        "RESTOCK_REQUIRED or UNAVAILABLE from the assessments."
+    ),
+    tools=named_tools([tool_get_inventory_snapshot, tool_check_stock_level,
+                       tool_check_supplier_delivery, tool_assess_line_item,
+                       tool_place_supplier_restock]),
+)
+
+quoting_agent = Agent(
+    build_model(quoting_policy),
+    deps_type=OrderContext,
+    output_type=str,
+    name="quoting_agent",
+    system_prompt=(
+        "You are the Quoting Agent for Beaver's Choice Paper Company. Call "
+        "search_quote_history with ONE short keyword (the event type or main product) to see "
+        "comparable historical quotes, then call calculate_quote, which applies the official "
+        "bulk-discount tiers. Never invent prices or discounts. Return the calculate_quote result."
+    ),
+    tools=named_tools([tool_search_quote_history, tool_calculate_quote]),
+)
+
+sales_agent = Agent(
+    build_model(sales_policy),
+    deps_type=OrderContext,
+    output_type=str,
+    name="sales_agent",
+    system_prompt=(
+        "You are the Sales Agent for Beaver's Choice Paper Company. Call check_cash_balance. "
+        "If the prompt says LARGE_ORDER=yes, call financial_health_check before booking. "
+        "Then call finalize_sale exactly once and return its result."
+    ),
+    tools=named_tools([tool_check_cash_balance, tool_financial_health_check, tool_finalize_sale]),
+)
+
+
+# --- Orchestrator delegation tools -----------------------------------------
+def tool_parse_request(ctx: RunContext[OrderContext]) -> str:
+    """Extract line items (description + quantity), deadline and request date from
+    the customer's original message and store them on the shared order record.
+    (The message is read from the blackboard so it is never paraphrased.)"""
+    order = ctx.deps
+    parsed = parse_customer_request(order.request_text)
+    order.deadline = parsed["deadline"] or order.deadline
+    order.line_items = [LineItem(i["description"], i["quantity"]) for i in parsed["items"]]
+    return json.dumps(parsed)
+
+
+async def tool_delegate_to_inventory_agent(ctx: RunContext[OrderContext]) -> str:
+    """Ask the Inventory Agent to check stock / restock every parsed line item."""
+    order = ctx.deps
+    prompt = (f"LINE_COUNT={len(order.line_items)}\nRequest date: {order.request_date}\n"
+              f"Customer deadline: {order.deadline}\nLines: " +
+              json.dumps([{"index": i, "description": l.description, "quantity": l.quantity}
+                          for i, l in enumerate(order.line_items)]))
+    result = await inventory_agent.run(prompt, deps=order, usage=ctx.usage)
+    order.log(f"inventory agent: {result.output}")
+    # Ground truth comes from the blackboard, not from the agent's wording.
+    statuses = [f"line {i}: {l.status.upper().replace('RESTOCK', 'RESTOCK_REQUIRED')}"
+                f"{' - ' + l.reason if l.reason else ''}" for i, l in enumerate(order.line_items)]
+    return "; ".join(statuses)
+
+
+async def tool_delegate_to_quoting_agent(ctx: RunContext[OrderContext]) -> str:
+    """Ask the Quoting Agent to price the fulfillable lines (with bulk discounts)."""
+    order = ctx.deps
+    sellable = [l.catalog_item for l in order.line_items if l.status in ("available", "restock")]
+    event_match = re.search(r"\b(ceremony|parade|conference|reception|party|assembly|exhibition|"
+                            r"show|gathering|performance|demonstration|concert|festival|meeting)\b",
+                            order.request_text, re.IGNORECASE)
+    terms = [event_match.group(1).lower()] if event_match else []
+    terms += [name.split()[0].lower() for name in sellable]
+    prompt = f"SEARCH_TERMS={'|'.join(terms)}\nItems to quote: {sellable}"
+    result = await quoting_agent.run(prompt, deps=order, usage=ctx.usage)
+    order.log(f"quoting agent: {result.output}")
+    return result.output
+
+
+async def tool_delegate_to_sales_agent(ctx: RunContext[OrderContext]) -> str:
+    """Ask the Sales Agent to finalize the quoted sale in the database."""
+    order = ctx.deps
+    is_large = order.quote_total >= LARGE_ORDER_THRESHOLD
+    prompt = (f"LARGE_ORDER={'yes' if is_large else 'no'}\n"
+              f"Quoted total: ${order.quote_total:,.2f}. Finalize the sale.")
+    result = await sales_agent.run(prompt, deps=order, usage=ctx.usage)
+    order.log(f"sales agent: {result.output}")
+    return result.output
+
+
+orchestrator_agent = Agent(
+    build_model(orchestrator_policy),
+    deps_type=OrderContext,
+    output_type=str,
+    name="orchestrator_agent",
+    system_prompt=(
+        "You are the Orchestrator (customer service lead) of Beaver's Choice Paper Company. "
+        "For every customer message:\n"
+        "1. Call parse_request to extract the requested items and deadline.\n"
+        "2. If items were found, call delegate_to_inventory_agent.\n"
+        "3. If at least one line is AVAILABLE or RESTOCK_REQUIRED, call "
+        "delegate_to_quoting_agent and then delegate_to_sales_agent (the customer has asked "
+        "to place the order, so quotes are accepted automatically).\n"
+        "4. Call compose_customer_response and reply to the customer with that text. You may "
+        "polish the wording but keep every item, price, discount reason, delivery date and "
+        "reason for unavailable items. NEVER reveal cash balances, supplier costs, margins, "
+        "transaction ids or internal errors."
+    ),
+    tools=named_tools([tool_parse_request, tool_delegate_to_inventory_agent,
+                       tool_delegate_to_quoting_agent, tool_delegate_to_sales_agent,
+                       tool_get_order_status, tool_compose_customer_response]),
+)
+
+
+def handle_customer_request(request_with_date: str) -> str:
+    """Entry point: run the whole multi-agent workflow for one customer request."""
+    parsed = parse_customer_request(request_with_date)
+    order = OrderContext(request_text=request_with_date, request_date=parsed["request_date"],
+                         deadline=parsed["deadline"])
+    try:
+        result = orchestrator_agent.run_sync(request_with_date, deps=order)
+        return result.output.strip()
+    except Exception as error:  # never leak internal errors to the customer
+        print(f"INTERNAL ERROR while handling request: {error!r}")
+        if order.sale_completed or order.line_items:
+            return compose_customer_response(order)
+        return ("We're sorry - we could not process your request right now. "
+                "A member of our team will follow up with you shortly.")
 
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
@@ -613,7 +1416,7 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 def run_test_scenarios():
     
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
@@ -638,6 +1441,7 @@ def run_test_scenarios():
     ############
     ############
     ############
+    print(f"Multi-agent system ready ({'OFFLINE scripted policies' if OFFLINE_MODE else 'LLM: ' + OPENAI_MODEL_NAME}).")
 
     results = []
     for idx, row in quote_requests_sample.iterrows():
@@ -660,7 +1464,7 @@ def run_test_scenarios():
         ############
         ############
 
-        # response = call_your_multi_agent_system(request_with_date)
+        response = handle_customer_request(request_with_date)
 
         # Update state
         report = generate_financial_report(request_date)
@@ -681,7 +1485,8 @@ def run_test_scenarios():
             }
         )
 
-        time.sleep(1)
+        if not OFFLINE_MODE:
+            time.sleep(1)  # be gentle with the API rate limit
 
     # Final report
     final_date = quote_requests_sample["request_date"].max().strftime("%Y-%m-%d")
